@@ -1,97 +1,94 @@
-# ve@r.com Reverse Proxy
-A standalone, OpenAI-compatible reverse proxy that connects directly to ve@r.com's WebSocket backend. This allows you to use premium web-based models (such as GPT-5, Claude 4.6) locally in your own applications (like simple terminals, Python scripts, LangChain, etc.) that expect a standard structured OpenAI API.
+# Vear.com Reverse Proxy
 
-## Features
-- **OpenAI Streaming Compatibility:** Sends requests and formats the stream chunks precisely in the `chat.completion.chunk` Server-Sent Events (SSE) format.
-- **WebSocket Interception:** Disguises the connection as an Android client to bypass CloudFlare blocks. 
-- **Universal Provider Endpoint:** Maps ve@r.com models flawlessly using simple aliases.
+A standalone, OpenAI-compatible reverse proxy that connects directly to Vear.com's WebSocket backend. This allows you to use premium web-based models (such as GPT-5, Claude 4.6, Gemini 3.1, Grok 4.1) locally in your own applications (like simple terminals, Python scripts, LangChain, etc.) that expect a standard OpenAI API.
 
----
+**Zero config. No API keys, no cookies, no accounts needed.**
 
-## 🔑 Quick Start Setup
+## How It Works
+
+The proxy reverse-engineers Vear.com's authentication from their frontend JavaScript:
+
+1. **Auto-fetches a `_wt` token** from Vear.com's server-rendered HTML on each request (publicly accessible, no login).
+2. **Generates an HMAC-signed fingerprint (`fp`)** using the signing key extracted from `dist.js` (`vr_8x$kQ2m!pL7dZw3Nf9RjY6aTcE1bH`).
+3. **Connects over WebSocket** to `wss://vear.com/conversation/go` with the correct model routing IDs (`m`/`ms`).
+4. **Formats responses** as OpenAI-compatible SSE `chat.completion.chunk` events.
+
+No PHPSESSID cookie, no browser login, no manual key collection.
+
+## Quick Start
 
 ### 1. Install Dependencies
 ```bash
-cd ve@r-reverse
+cd vear-reverse
 npm install
 ```
 
 ### 2. Configure Environment (`.env`)
-1. Create a file named `.env` by copying our template:
-   ```bash
-   cp .env.example .env
-   ```
-2. Retrieve your `ve@r_COOKIE`:
-   - Open your Thorium/Chrome browser.
-   - Go to `https://ve@r.com/` and log in (if necessary).
-   - Right-click anywhere, select **Inspect** to open Developer Tools.
-   - Go to the **Application** tab. On the left side, under **Storage**, expand **Cookies** and click on `https://ve@r.com`.
-   - Find the cookie named `PHPSESSID`. 
-   - Copy only its Value (e.g., `0e9mjc775v425cg00dvuuhvv2j`).
-3. Set your internal `ALLOWED_TOKENS` proxy password (this ensures random people on the internet can't use your proxy if exposed).
-4. Paste the details into your `.env` file like this:
-   ```env
-   # Your proxy password:
-   ALLOWED_TOKENS=sk-ve@r-proxy-token-change-me
-
-   # Your actual ve@r bypass cookie (can be a comma-separated list of cookies for rotation/stacking):
-   ve@r_COOKIE=0e9mjc775v425cg00dvuuhvv2j,cookie2,cookie3
-   ```
+```bash
+cp .env.example .env
+```
+Edit `.env` — set `ALLOWED_TOKENS` to your desired proxy password. That's it.
 
 ### 3. Start the Proxy Server
 ```bash
 npm start
 ```
-The server will now listen locally on port `3011`. 
+The server will listen on port `3001`.
 
 ---
 
-## 📡 Using the API
+## Using the API
 
-You can point any OpenAI-compatible application to `http://localhost:3011/v1`. 
+Point any OpenAI-compatible application to `http://localhost:3001/v1`.
 
 ### Check Available Models
-Returns a JSON list of all the ve@r mapped models:
 ```bash
-curl -X GET http://localhost:3011/v1/models \
-  -H "Authorization: Bearer sk-ve@r-proxy-token-change-me"
+curl -X GET http://localhost:3001/v1/models \
+  -H "Authorization: Bearer sk-vear-proxy-token-change-me"
 ```
 
-### Prompting Models (Chat Completions)
-Sends a request utilizing ve@r.com's websockets behind the scene:
+### Prompt a Model (Chat Completions)
 ```bash
-curl -X POST http://localhost:3011/v1/chat/completions \
+curl -X POST http://localhost:3001/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-ve@r-proxy-token-change-me" \
+  -H "Authorization: Bearer sk-vear-proxy-token-change-me" \
   -d '{
-    "model": "ve@r/claude-4.6-sonnet",
+    "model": "vear/claude-4.6-sonnet",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
 ```
 
 ### Supported Models
-You must prefix your requested models with `ve@r/`:
+
+Prefix all models with `vear/`:
 
 **Anthropic**
-- `ve@r/claude-4.6-opus`
-- `ve@r/claude-4.6-sonnet`
-- `ve@r/claude-4.5-opus`
-- `ve@r/claude-4.5-sonnet`
-- `ve@r/claude-4.5-haiku`
+- `vear/claude-4.6-opus`
+- `vear/claude-4.6-sonnet`
+- `vear/claude-4.5-opus`
+- `vear/claude-4.5-sonnet`
+- `vear/claude-4.5-haiku`
 
 **OpenAI**
-- `ve@r/gpt-5.4`
-- `ve@r/gpt-5.2`
-- `ve@r/gpt-5.1`
-- `ve@r/gpt-5`
-- `ve@r/gpt-5-mini`
-- `ve@r/gpt-5-nano`
+- `vear/gpt-5.4`
+- `vear/gpt-5.2`
+- `vear/gpt-5.1`
+- `vear/gpt-5`
+- `vear/gpt-5-mini`
+- `vear/gpt-5-nano`
 
-**Gemini**
-- `ve@r/gemini-3.1-pro` 
-- `ve@r/gemini-3.0-pro`
+**Google**
+- `vear/gemini-3.1-pro`
+- `vear/gemini-3.0-pro`
 
-**Grok**
-- `ve@r/grok-4.1`
-- `ve@r/grok-4`
+**xAI**
+- `vear/grok-4.1`
+- `vear/grok-4`
+
+**DeepSeek**
+- `vear/deepseek-v3`
+- `vear/deepseek-r1`
+
+**Image**
+- `vear/dall-e-3`
