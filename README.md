@@ -1,19 +1,21 @@
-# Vear.com Reverse Proxy
+# ve@r Reverse Proxy
 
-A standalone, OpenAI-compatible reverse proxy that connects directly to Vear.com's WebSocket backend. This allows you to use premium web-based models (such as GPT-5, Claude 4.6, Gemini 3.1, Grok 4.1) locally in your own applications (like simple terminals, Python scripts, LangChain, etc.) that expect a standard OpenAI API.
+A standalone, OpenAI-compatible reverse proxy that connects directly to ve@r's WebSocket backend. This allows you to use premium web-based models (such as GPT-5, Claude 4.6, Gemini 3.1, Grok 4.1) locally in your own applications (like simple terminals, Python scripts, LangChain, etc.) that expect a standard OpenAI API.
 
 **Zero config. No API keys, no cookies, no accounts needed.**
 
 ## How It Works
 
-The proxy reverse-engineers Vear.com's authentication from their frontend JavaScript:
+The proxy reverse-engineers ve@r's authentication from their frontend JavaScript:
 
-1. **Auto-fetches a `_wt` token** from Vear.com's server-rendered HTML on each request (publicly accessible, no login).
+1. **Auto-fetches a `_wt` token** from ve@r's server-rendered HTML on each request (publicly accessible, no login).
 2. **Generates an HMAC-signed fingerprint (`fp`)** using the signing key extracted from `dist.js` (`vr_8x$kQ2m!pL7dZw3Nf9RjY6aTcE1bH`).
 3. **Connects over WebSocket** to `wss://vear.com/conversation/go` with the correct model routing IDs (`m`/`ms`).
 4. **Formats responses** as OpenAI-compatible SSE `chat.completion.chunk` events.
 
 No PHPSESSID cookie, no browser login, no manual key collection.
+
+> **Note:** The `vear/` prefix in model names is part of the API routing and should not be changed.
 
 ## Quick Start
 
