@@ -1,12 +1,14 @@
 require('dotenv').config();
 
+// Cookie pool: parse VEAR_COOKIE (comma-separated PHPSESSID values)
+const cookiePool = (process.env.VEAR_COOKIE || '').split(',').map(c => c.trim()).filter(Boolean);
+
 module.exports = {
   port: parseInt(process.env.PORT) || 3001,
   nodeEnv: process.env.NODE_ENV || 'development',
-  
-  // Model mapping with Vear.com's internal routing IDs (m = provider, ms = model variant).
+
+  // Model mapping with ve@r's internal routing IDs (m = provider, ms = model variant).
   // Extracted from dist.js and the frontend's data-id/data-subid attributes.
-  // No API keys or cookies needed — the proxy auto-fetches a _wt token per request.
   models: {
     // Anthropic (m=11)
     'vear/claude-4.6-opus':   { provider: 'vear', m: 11, ms: 11, supports_streaming: true },
@@ -38,17 +40,26 @@ module.exports = {
     // DALL-E 3 (m=21, image model — streaming not applicable)
     'vear/dall-e-3': { provider: 'vear', m: 21, ms: 1, supports_streaming: false }
   },
-  
+
   auth: {
     mode: process.env.AUTH_MODE || 'bearer',
     allowed_tokens: (process.env.ALLOWED_TOKENS || '').split(',').filter(t => t.trim())
   },
-  
+
+  // Cookie pool (optional boost mode)
+  // If VEAR_COOKIE is set, cookies are used on rate-limit to get higher per-session quotas.
+  // If not set, proxy runs in anonymous mode (auto-fetch _wt token, no login).
+  cookiePool: {
+    enabled: cookiePool.length > 0,
+    cookies: cookiePool,
+    count: cookiePool.length
+  },
+
   timeouts: {
     upstream_request_ms: parseInt(process.env.UPSTREAM_TIMEOUT_MS) || 120000,
     idle_connection_ms: 30000
   },
-  
+
   logging: {
     level: process.env.LOG_LEVEL || 'info',
     logRequestBodies: process.env.LOG_REQUEST_BODIES === 'true'

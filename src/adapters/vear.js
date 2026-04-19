@@ -1,8 +1,9 @@
 const WebSocket = require('ws');
 const https = require('https');
 const crypto = require('crypto');
+const config = require('../../config');
 
-// Hardcoded HMAC key extracted from Vear.com's dist.js frontend source.
+// Hardcoded HMAC key extracted from ve@r's dist.js frontend source.
 // Used by F() to sign the telemetry fingerprint.
 const HMAC_KEY = 'vr_8x$kQ2m!pL7dZw3Nf9RjY6aTcE1bH';
 const HMAC_KEY_BUF = Buffer.from(HMAC_KEY, 'utf8');
@@ -11,6 +12,9 @@ const HMAC_KEY_BUF = Buffer.from(HMAC_KEY, 'utf8');
 let cachedWt = null;
 let cachedWtExpiry = 0;
 const WT_TTL_MS = 4 * 60 * 1000; // Refresh every 4 minutes
+
+// Cookie pool state
+let cookieIndex = 0;
 
 /**
  * Generate a random alphanumeric string
@@ -25,19 +29,23 @@ function generateId(length = 20) {
 }
 
 /**
- * Fetch the _wt token from Vear.com's server-rendered HTML.
+ * Fetch the _wt token from ve@r's server-rendered HTML.
  * No cookie is required — the page is publicly accessible.
  */
-function fetchWtToken() {
+function fetchWtToken(cookie) {
   return new Promise((resolve, reject) => {
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    };
+    if (cookie) {
+      headers['Cookie'] = `PHPSESSID=${cookie}`;
+    }
     const req = https.request({
       hostname: 'vear.com',
       path: '/',
       method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      }
+      headers
     }, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
@@ -46,22 +54,28 @@ function fetchWtToken() {
         if (match && match[1]) {
           resolve(match[1]);
         } else {
-          reject(new Error('_wt token not found in Vear.com HTML response'));
+          reject(new Error('_wt token not found in HTML response'));
         }
       });
     });
     req.on('error', reject);
     req.setTimeout(10000, () => {
-      req.destroy(new Error('Timeout fetching _wt token from vear.com'));
+      req.destroy(new Error('Timeout fetching _wt token'));
     });
     req.end();
   });
 }
 
 /**
- * Get a cached _wt token, refreshing if expired
+ * Get a cached _wt token, refreshing if expired.
+ * Optionally uses a cookie for a session-bound token.
  */
-async function getWtToken() {
+async function getWtToken(cookie) {
+  // If a cookie is provided, always fetch fresh (session tokens may differ)
+  if (cookie) {
+    return fetchWtToken(cookie);
+  }
+  // Anonymous mode: use cache
   if (cachedWt && Date.now() < cachedWtExpiry) {
     return cachedWt;
   }
@@ -71,16 +85,28 @@ async function getWtToken() {
 }
 
 /**
+ * Pick next cookie from the pool (round-robin)
+ */
+function pickCookie() {
+  const pool = config.cookiePool.cookies;
+  if (pool.length === 0) return null;
+  const cookie = pool[cookieIndex % pool.length];
+  cookieIndex++;
+  return cookie;
+}
+
+/**
  * Generate the fp (fingerprint) field using HMAC-SHA256,
- * replicating the F() function from Vear.com's dist.js.
+ * replicating the F() function from ve@r's dist.js.
  *
  * F(telemetryHash) = telemetryHash + s + hex(HMAC-SHA256(key, telemetryHash + ':' + s))
  * where s = hex(Date.now())[0:12] + hex(random 0-65535)[0:4], sliced to 16 chars
  *
- * Vear's server requires a non-empty telemetryHash (32-char hex, like MurmurHash3 output).
+ * The server requires a non-empty telemetryHash (32-char hex, like MurmurHash3 output).
  * We use a deterministic placeholder — the server does not validate it against a real fingerprint.
  */
 const PLACEHOLDER_TELEMETRY = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4';
+
 function generateFingerprint() {
   const timestampHex = Date.now().toString(16).padStart(12, '0');
   const randomHex = Math.floor(Math.random() * 65535).toString(16).padStart(4, '0');
@@ -92,28 +118,24 @@ function generateFingerprint() {
 }
 
 /**
- * Execute request to Vear.com API via WebSockets (no cookie needed)
+ * Create a WebSocket connection to ve@r with optional cookie auth
+ */
+function createWsConnection(cookie) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
+    'Origin': 'https://vear.com'
+  };
+  if (cookie) {
+    headers['Cookie'] = `PHPSESSID=${cookie}`;
+  }
+  return new WebSocket('wss://vear.com/conversation/go', { headers });
+}
+
+/**
+ * Core WS request logic. Returns a promise that resolves with the result.
+ * If rate-limited and a cookie pool is available, retries with a cookie.
  */
 async function execute(vearPayload, modelConfig) {
-  // Fetch _wt token automatically — no manual config required
-  let wt;
-  try {
-    wt = await getWtToken();
-  } catch (err) {
-    throw {
-      upstream: true,
-      type: 'wt_fetch_error',
-      message: `Failed to fetch _wt token from vear.com: ${err.message}`,
-      verbose: {
-        hint: 'The proxy automatically fetches a token from vear.com. Check your network connection.',
-        original_error: err.message
-      }
-    };
-  }
-
-  // Generate HMAC-signed fingerprint
-  const fp = generateFingerprint();
-
   // Extract the latest user message from the payload
   const messages = vearPayload.messages || [];
   const latestMessage = messages[messages.length - 1];
@@ -133,21 +155,52 @@ async function execute(vearPayload, modelConfig) {
     };
   }
 
+  // Try anonymous first, fall back to cookie pool on rate limit
+  try {
+    return await wsRequest(vearPayload, { m, ms, modelId, prompt, cookie: null });
+  } catch (err) {
+    if (err.type === 'vear_rate_limited' && config.cookiePool.enabled) {
+      console.log('[VEAR] Rate limited (anonymous). Retrying with cookie from pool...');
+      const cookie = pickCookie();
+      if (cookie) {
+        return await wsRequest(vearPayload, { m, ms, modelId, prompt, cookie });
+      }
+    }
+    throw err;
+  }
+}
+
+/**
+ * Execute a single WebSocket request
+ */
+async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
+  // Fetch _wt token (session-bound if cookie provided, cached if anonymous)
+  let wt;
+  try {
+    wt = await getWtToken(cookie);
+  } catch (err) {
+    throw {
+      upstream: true,
+      type: 'wt_fetch_error',
+      message: `Failed to fetch _wt token: ${err.message}`,
+      verbose: {
+        hint: 'Check your network connection to vear.com.',
+        mode: cookie ? 'cookie' : 'anonymous',
+        original_error: err.message
+      }
+    };
+  }
+
+  const fp = generateFingerprint();
+  const isStreaming = vearPayload.stream !== false;
+
   const { PassThrough } = require('stream');
   const responseStream = new PassThrough();
-
-  const isStreaming = vearPayload.stream !== false;
   let fullResponse = '';
 
   const uid = `uid-${generateId(15)}`;
   const mid = `mid-${generateId(25)}`;
-
-  const ws = new WebSocket('wss://vear.com/conversation/go', {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
-      'Origin': 'https://vear.com'
-    }
-  });
+  const ws = createWsConnection(cookie);
 
   return new Promise((resolve, reject) => {
     const upstreamTimeout = setTimeout(() => {
@@ -155,7 +208,7 @@ async function execute(vearPayload, modelConfig) {
       reject({
         upstream: true,
         type: 'upstream_timeout',
-        message: 'Vear.com WebSocket connection timed out'
+        message: 'WebSocket connection timed out'
       });
     }, 120000);
 
@@ -197,13 +250,12 @@ async function execute(vearPayload, modelConfig) {
             reject({
               upstream: true,
               type: errorType,
-              message: msg.c || 'Unknown error from Vear.com',
-              verbose: { serverCode: msg.t, modelId, m, ms }
+              message: msg.c || 'Unknown error from server',
+              verbose: { serverCode: msg.t, modelId, m, ms, mode: cookie ? 'cookie' : 'anonymous' }
             });
             return;
           } else if (msg.t === 's') {
-            // 's' = first message / echo of the user prompt — skip for output
-            // (we only use it for the cid/sid metadata if needed)
+            // 's' = echo of the user prompt — skip for output
           } else if (msg.t === 'm' && msg.c) {
             // Content token (actual model output)
             fullResponse += msg.c;
