@@ -48,11 +48,14 @@ router.post('/', async (req, res, next) => {
       if (proxyFn) {
         proxyFn(result.response, res);
       } else if (provider === 'vear') {
-        // Vear adapter directly emits valid SSE strings, so we can just pipe directly.
-        // We set the standard SSE headers first.
+        // Vear adapter writes SSE-formatted strings to its PassThrough stream.
+        // We pipe them to the HTTP response with immediate flushing.
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx/reverse-proxy buffering
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.flushHeaders(); // Send headers immediately so curl sees the connection open
         
         result.response.on('data', chunk => {
           res.write(chunk);

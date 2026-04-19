@@ -8,7 +8,7 @@ const config = require('../../config');
 const HMAC_KEY = 'vr_8x$kQ2m!pL7dZw3Nf9RjY6aTcE1bH';
 const HMAC_KEY_BUF = Buffer.from(HMAC_KEY, 'utf8');
 
-// Cached _wt token and its expiry
+// Cached _wt token and its expiry (anonymous mode only)
 let cachedWt = null;
 let cachedWtExpiry = 0;
 const WT_TTL_MS = 4 * 60 * 1000; // Refresh every 4 minutes
@@ -68,10 +68,9 @@ function fetchWtToken(cookie) {
 
 /**
  * Get a cached _wt token, refreshing if expired.
- * Optionally uses a cookie for a session-bound token.
+ * If a cookie is provided, always fetch fresh (session tokens may differ).
  */
 async function getWtToken(cookie) {
-  // If a cookie is provided, always fetch fresh (session tokens may differ)
   if (cookie) {
     return fetchWtToken(cookie);
   }
@@ -98,15 +97,8 @@ function pickCookie() {
 /**
  * Generate the fp (fingerprint) field using HMAC-SHA256,
  * replicating the F() function from ve@r's dist.js.
- *
- * F(telemetryHash) = telemetryHash + s + hex(HMAC-SHA256(key, telemetryHash + ':' + s))
- * where s = hex(Date.now())[0:12] + hex(random 0-65535)[0:4], sliced to 16 chars
- *
- * The server requires a non-empty telemetryHash (32-char hex, like MurmurHash3 output).
- * We use a deterministic placeholder — the server does not validate it against a real fingerprint.
  */
 const PLACEHOLDER_TELEMETRY = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4';
-
 function generateFingerprint() {
   const timestampHex = Date.now().toString(16).padStart(12, '0');
   const randomHex = Math.floor(Math.random() * 65535).toString(16).padStart(4, '0');
@@ -118,7 +110,7 @@ function generateFingerprint() {
 }
 
 /**
- * Create a WebSocket connection to ve@r with optional cookie auth
+ * Create a WebSocket connection to ve@r with optional cookie
  */
 function createWsConnection(cookie) {
   const headers = {
@@ -132,17 +124,13 @@ function createWsConnection(cookie) {
 }
 
 /**
- * Core WS request logic. Returns a promise that resolves with the result.
- * If rate-limited and a cookie pool is available, retries with a cookie.
+ * Execute request. Tries anonymous first, falls back to cookie pool on rate limit.
  */
 async function execute(vearPayload, modelConfig) {
-  // Extract the latest user message from the payload
   const messages = vearPayload.messages || [];
   const latestMessage = messages[messages.length - 1];
   const prompt = latestMessage ? latestMessage.content : '';
   const modelId = vearPayload.model;
-
-  // Vear model routing IDs from the frontend source
   const m = modelConfig.m;
   const ms = modelConfig.ms;
 
@@ -171,10 +159,14 @@ async function execute(vearPayload, modelConfig) {
 }
 
 /**
- * Execute a single WebSocket request
+ * Execute a single WebSocket request.
+ *
+ * Key design: streaming mode does NOT resolve the promise on ws.open.
+ * Instead it resolves after the first valid content message (t:'s' or t:'m'),
+ * so that rate-limit/error messages (t:'b', t:'e') are properly rejected
+ * before the route handler starts piping the stream.
  */
 async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
-  // Fetch _wt token (session-bound if cookie provided, cached if anonymous)
   let wt;
   try {
     wt = await getWtToken(cookie);
@@ -193,11 +185,6 @@ async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
 
   const fp = generateFingerprint();
   const isStreaming = vearPayload.stream !== false;
-
-  const { PassThrough } = require('stream');
-  const responseStream = new PassThrough();
-  let fullResponse = '';
-
   const uid = `uid-${generateId(15)}`;
   const mid = `mid-${generateId(25)}`;
   const ws = createWsConnection(cookie);
@@ -212,52 +199,61 @@ async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
       });
     }, 120000);
 
+    let resolved = false;
+    let fullResponse = '';
+    const { PassThrough } = require('stream');
+    const responseStream = new PassThrough();
+
     ws.on('open', () => {
-      const payload = {
-        uid: uid,
-        mid: mid,
-        fp: fp,
-        wt: wt,
+      ws.send(JSON.stringify({
+        uid, mid, fp, wt,
         q: prompt,
-        m: m,
-        ms: ms,
+        m, ms,
         t: 'm'
-      };
-
-      ws.send(JSON.stringify(payload));
-
-      if (isStreaming) {
-        resolve({ stream: true, response: responseStream });
-      }
+      }));
     });
 
     ws.on('message', (data) => {
       try {
-        const msgStr = data.toString();
-        const parts = msgStr.split('\n').filter(p => p.trim());
-
+        const parts = data.toString().split('\n').filter(p => p.trim());
         for (const part of parts) {
           const msg = JSON.parse(part);
 
           if (msg.t === 'e' || msg.t === 'b') {
-            // Error (e) or rate-limit/block (b) from server
+            // Error or rate-limit — reject before or after resolve
             clearTimeout(upstreamTimeout);
             ws.close();
-            if (isStreaming) {
-              responseStream.end();
+            responseStream.end();
+            if (!resolved) {
+              const errorType = msg.t === 'b' ? 'vear_rate_limited' : 'vear_server_error';
+              reject({
+                upstream: true,
+                type: errorType,
+                message: msg.c || 'Unknown error from server',
+                verbose: { serverCode: msg.t, modelId, m, ms, mode: cookie ? 'cookie' : 'anonymous' }
+              });
+            } else {
+              // Stream was already handed to client — emit an error event on the stream
+              responseStream.emit('error', new Error(msg.c || 'Server error'));
             }
-            const errorType = msg.t === 'b' ? 'vear_rate_limited' : 'vear_server_error';
-            reject({
-              upstream: true,
-              type: errorType,
-              message: msg.c || 'Unknown error from server',
-              verbose: { serverCode: msg.t, modelId, m, ms, mode: cookie ? 'cookie' : 'anonymous' }
-            });
             return;
           } else if (msg.t === 's') {
-            // 's' = echo of the user prompt — skip for output
+            // Echo of user prompt — skip output, but if not yet resolved, resolve now
+            // (first valid message means the connection is working)
+            if (!resolved) {
+              resolved = true;
+              if (isStreaming) {
+                resolve({ stream: true, response: responseStream });
+              }
+            }
           } else if (msg.t === 'm' && msg.c) {
-            // Content token (actual model output)
+            // Content token
+            if (!resolved) {
+              resolved = true;
+              if (isStreaming) {
+                resolve({ stream: true, response: responseStream });
+              }
+            }
             fullResponse += msg.c;
             if (isStreaming) {
               const chunk = formatSSEChunk(msg.c, modelId);
@@ -267,11 +263,19 @@ async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
             // End of stream
             clearTimeout(upstreamTimeout);
             if (isStreaming) {
-              const endChunk = formatSSEChunk('', modelId, 'stop');
-              responseStream.write(`data: ${JSON.stringify(endChunk)}\n\n`);
-              responseStream.write('data: [DONE]\n\n');
+              if (resolved) {
+                const endChunk = formatSSEChunk('', modelId, 'stop');
+                responseStream.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+                responseStream.write('data: [DONE]\n\n');
+              }
               responseStream.end();
+              if (!resolved) {
+                // Empty response — resolve so route handler doesn't hang
+                resolved = true;
+                resolve({ stream: true, response: responseStream });
+              }
             } else {
+              resolved = true;
               resolve({
                 stream: false,
                 data: formatFullResponse(fullResponse, modelId)
@@ -287,19 +291,21 @@ async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
 
     ws.on('error', (err) => {
       clearTimeout(upstreamTimeout);
-      if (isStreaming) {
-        responseStream.end();
+      responseStream.end();
+      if (!resolved) {
+        reject({
+          upstream: true,
+          type: 'upstream_error',
+          message: err.message
+        });
+      } else {
+        responseStream.emit('error', err);
       }
-      reject({
-        upstream: true,
-        type: 'upstream_error',
-        message: err.message
-      });
     });
 
     ws.on('close', () => {
       clearTimeout(upstreamTimeout);
-      if (isStreaming) {
+      if (!responseStream.writableEnded) {
         responseStream.end();
       }
     });
