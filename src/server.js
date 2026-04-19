@@ -99,13 +99,12 @@ const server = app.listen(config.port, () => {
   console.log('  ╠══════════════════════════════════════════════════╣');
 
   if (config.cookiePool.enabled) {
-    console.log(`  ║  🍪 Cookie pool: ${config.cookiePool.count} session(s) loaded        ║`);
-    console.log('  ║     → Higher quota: requests use cookies first  ║');
-    console.log('  ║     → Falls back to anonymous on exhaustion      ║');
+    console.log(`  ║  🍪 Cookie pool: ${config.cookiePool.count} account(s) loaded         ║`);
+    console.log('  ║     → Falls back to user_auth cookie on rate limit  ║');
   } else {
-    console.log('  ║  🍪 Cookie pool: none (anonymous mode)           ║');
-    console.log('  ║     → Add VEAR_COOKIE to .env for higher quota   ║');
-    console.log('  ║     → Format: PHPSESSID1,PHPSESSID2,PHPSESSID3   ║');
+    console.log('  ║  🍪 Cookie pool: none (anonymous mode)            ║');
+    console.log('  ║     → Add VEAR_USER_AUTH to .env for higher quota  ║');
+    console.log('  ║     → DevTools → Cookies → user_auth (paste value)     ║');
   }
 
   console.log('  ╚══════════════════════════════════════════════════╝');

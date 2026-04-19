@@ -30,16 +30,17 @@ function generateId(length = 20) {
 
 /**
  * Fetch the _wt token from ve@r's server-rendered HTML.
- * No cookie is required — the page is publicly accessible.
+ * If userAuth is provided, sends the user_auth cookie for a logged-in session.
+ * Also captures the server-assigned PHPSESSID from Set-Cookie.
  */
-function fetchWtToken(cookie) {
+function fetchWtToken(userAuth) {
   return new Promise((resolve, reject) => {
     const headers = {
       'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
     };
-    if (cookie) {
-      headers['Cookie'] = `PHPSESSID=${cookie}`;
+    if (userAuth) {
+      headers['Cookie'] = `user_auth=${userAuth}`;
     }
     const req = https.request({
       hostname: 'vear.com',
@@ -47,12 +48,17 @@ function fetchWtToken(cookie) {
       method: 'GET',
       headers
     }, (res) => {
+      // Capture the PHPSESSID the server assigns (needed for WS)
+      const setCookie = res.headers['set-cookie'];
+      const phpsessidMatch = setCookie && setCookie.find(c => c.startsWith('PHPSESSID='));
+      const phpsessid = phpsessidMatch ? phpsessidMatch.match(/PHPSESSID=([^;]+)/)[1] : null;
+
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
         const match = data.match(/window\._wt='([^']+)'/);
         if (match && match[1]) {
-          resolve(match[1]);
+          resolve({ wt: match[1], phpsessid });
         } else {
           reject(new Error('_wt token not found in HTML response'));
         }
@@ -68,19 +74,21 @@ function fetchWtToken(cookie) {
 
 /**
  * Get a cached _wt token, refreshing if expired.
- * If a cookie is provided, always fetch fresh (session tokens may differ).
+ * If userAuth is provided, fetches fresh with that cookie (logged-in session).
+ * Returns { wt, phpsessid } — phpsessid is needed for the WS connection.
  */
-async function getWtToken(cookie) {
-  if (cookie) {
-    return fetchWtToken(cookie);
+async function getWtToken(userAuth) {
+  if (userAuth) {
+    return fetchWtToken(userAuth);
   }
   // Anonymous mode: use cache
   if (cachedWt && Date.now() < cachedWtExpiry) {
-    return cachedWt;
+    return { wt: cachedWt, phpsessid: null };
   }
-  cachedWt = await fetchWtToken();
+  const result = await fetchWtToken();
+  cachedWt = result.wt;
   cachedWtExpiry = Date.now() + WT_TTL_MS;
-  return cachedWt;
+  return result;
 }
 
 /**
@@ -110,15 +118,23 @@ function generateFingerprint() {
 }
 
 /**
- * Create a WebSocket connection to ve@r with optional cookie
+ * Create a WebSocket connection to ve@r.
+ * If userAuth is provided, sends both user_auth and the server-assigned PHPSESSID.
  */
-function createWsConnection(cookie) {
+function createWsConnection(userAuth, phpsessid) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
     'Origin': 'https://vear.com'
   };
-  if (cookie) {
-    headers['Cookie'] = `PHPSESSID=${cookie}`;
+  const cookieParts = [];
+  if (userAuth) {
+    cookieParts.push(`user_auth=${userAuth}`);
+  }
+  if (phpsessid) {
+    cookieParts.push(`PHPSESSID=${phpsessid}`);
+  }
+  if (cookieParts.length > 0) {
+    headers['Cookie'] = cookieParts.join('; ');
   }
   return new WebSocket('wss://vear.com/conversation/go', { headers });
 }
@@ -145,13 +161,13 @@ async function execute(vearPayload, modelConfig) {
 
   // Try anonymous first, fall back to cookie pool on rate limit
   try {
-    return await wsRequest(vearPayload, { m, ms, modelId, prompt, cookie: null });
+    return await wsRequest(vearPayload, { m, ms, modelId, prompt, userAuth: null });
   } catch (err) {
     if (err.type === 'vear_rate_limited' && config.cookiePool.enabled) {
-      console.log('[VEAR] Rate limited (anonymous). Retrying with cookie from pool...');
-      const cookie = pickCookie();
-      if (cookie) {
-        return await wsRequest(vearPayload, { m, ms, modelId, prompt, cookie });
+      console.log('[VEAR] Rate limited (anonymous). Retrying with user_auth cookie...');
+      const userAuth = pickCookie();
+      if (userAuth) {
+        return await wsRequest(vearPayload, { m, ms, modelId, prompt, userAuth });
       }
     }
     throw err;
@@ -166,10 +182,10 @@ async function execute(vearPayload, modelConfig) {
  * so that rate-limit/error messages (t:'b', t:'e') are properly rejected
  * before the route handler starts piping the stream.
  */
-async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
-  let wt;
+async function wsRequest(vearPayload, { m, ms, modelId, prompt, userAuth }) {
+  let wtResult;
   try {
-    wt = await getWtToken(cookie);
+    wtResult = await getWtToken(userAuth);
   } catch (err) {
     throw {
       upstream: true,
@@ -177,17 +193,19 @@ async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
       message: `Failed to fetch _wt token: ${err.message}`,
       verbose: {
         hint: 'Check your network connection to vear.com.',
-        mode: cookie ? 'cookie' : 'anonymous',
+        mode: userAuth ? 'authenticated' : 'anonymous',
         original_error: err.message
       }
     };
   }
 
+  const { wt, phpsessid } = wtResult;
+
   const fp = generateFingerprint();
   const isStreaming = vearPayload.stream !== false;
   const uid = `uid-${generateId(15)}`;
   const mid = `mid-${generateId(25)}`;
-  const ws = createWsConnection(cookie);
+  const ws = createWsConnection(userAuth, phpsessid);
 
   return new Promise((resolve, reject) => {
     const upstreamTimeout = setTimeout(() => {
@@ -230,7 +248,7 @@ async function wsRequest(vearPayload, { m, ms, modelId, prompt, cookie }) {
                 upstream: true,
                 type: errorType,
                 message: msg.c || 'Unknown error from server',
-                verbose: { serverCode: msg.t, modelId, m, ms, mode: cookie ? 'cookie' : 'anonymous' }
+                verbose: { serverCode: msg.t, modelId, m, ms, mode: userAuth ? 'authenticated' : 'anonymous' }
               });
             } else {
               // Stream was already handed to client — emit an error event on the stream

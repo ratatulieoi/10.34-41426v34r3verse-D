@@ -1,7 +1,8 @@
 require('dotenv').config();
 
-// Cookie pool: parse VEAR_COOKIE (comma-separated PHPSESSID values)
-const cookiePool = (process.env.VEAR_COOKIE || '').split(',').map(c => c.trim()).filter(Boolean);
+// Cookie pool: parse VEAR_USER_AUTH (comma-separated user_auth cookie values)
+// user_auth is the real auth cookie — PHPSESSID is just a session container the server ignores.
+const cookiePool = (process.env.VEAR_USER_AUTH || '').split(',').map(c => c.trim()).filter(Boolean);
 
 module.exports = {
   port: parseInt(process.env.PORT) || 3001,
@@ -47,7 +48,8 @@ module.exports = {
   },
 
   // Cookie pool (optional boost mode)
-  // If VEAR_COOKIE is set, cookies are used on rate-limit to get higher per-session quotas.
+  // Each user_auth cookie = a logged-in account with its own quota.
+  // The proxy auto-creates a PHPSESSID for each — you only need user_auth.
   // If not set, proxy runs in anonymous mode (auto-fetch _wt token, no login).
   cookiePool: {
     enabled: cookiePool.length > 0,
